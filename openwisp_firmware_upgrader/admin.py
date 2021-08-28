@@ -75,9 +75,6 @@ class BuildAdmin(BaseVersionAdmin):
     # Allows apps that extend this modules to use this template with less hacks
     change_form_template = 'admin/firmware_upgrader/change_form.html'
 
-    class Media:
-        css = {'all': ('admin/css/firmware-upgrader.css',)}
-
     def organization(self, obj):
         return obj.category.organization
 
@@ -288,6 +285,9 @@ class DeviceFirmwareInline(MultitenantAdminMixin, admin.StackedInline):
     # https://github.com/theatlantic/django-nested-admin/issues/128#issuecomment-665833142
     sortable_options = {'disabled': True}
 
+    def _get_conditional_queryset(self, request, obj, select_related=False):
+        return bool(obj)
+
 
 class DeviceUpgradeOperationForm(UpgradeOperationForm):
     class Meta(UpgradeOperationForm.Meta):
@@ -324,21 +324,11 @@ class DeviceUpgradeOperationInline(UpgradeOperationInline):
             qs = qs.select_related()
         return qs
 
-
-def device_admin_get_inlines(self, request, obj):
-    # copy the list to avoid modifying the original data structure
-    inlines = self.inlines
-    if obj:
-        inlines = list(inlines)  # copy
-        inlines.append(DeviceFirmwareInline)
-        if (
-            DeviceUpgradeOperationInline(UpgradeOperation, admin.site)
-            .get_queryset(request, select_related=False)
-            .exists()
-        ):
-            inlines.append(DeviceUpgradeOperationInline)
-        return inlines
-    return inlines
+    def _get_conditional_queryset(self, request, obj, select_related=False):
+        if obj:
+            return self.get_queryset(request, select_related=False).exists()
+        return False
 
 
-DeviceAdmin.get_inlines = device_admin_get_inlines
+# DeviceAdmin.get_inlines = device_admin_get_inlines
+DeviceAdmin.conditional_inlines += [DeviceFirmwareInline, DeviceUpgradeOperationInline]

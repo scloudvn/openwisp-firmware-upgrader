@@ -3,7 +3,7 @@ import socket
 from hashlib import sha256
 from time import sleep
 
-from billiard import Process
+from billiard import Process, Queue
 from paramiko.ssh_exception import NoValidConnectionsError
 
 from openwisp_controller.connection.connectors.openwrt.ssh import OpenWrt as BaseOpenWrt
@@ -20,11 +20,13 @@ from ..settings import OPENWRT_SETTINGS
 class OpenWrt(BaseOpenWrt):
     CHECKSUM_FILE = '/etc/openwisp/firmware_checksum'
     REMOTE_UPLOAD_DIR = '/tmp'
-    RECONNECT_DELAY = OPENWRT_SETTINGS.get('reconnect_delay', 120)
+    RECONNECT_DELAY = OPENWRT_SETTINGS.get('reconnect_delay', 180)
     RECONNECT_RETRY_DELAY = OPENWRT_SETTINGS.get('reconnect_retry_delay', 20)
-    RECONNECT_MAX_RETRIES = OPENWRT_SETTINGS.get('reconnect_max_retries', 15)
+    RECONNECT_MAX_RETRIES = OPENWRT_SETTINGS.get('reconnect_max_retries', 35)
     UPGRADE_TIMEOUT = OPENWRT_SETTINGS.get('upgrade_timeout', 90)
-    UPGRADE_COMMAND = 'sysupgrade -v -c {path}'
+    UPGRADE_COMMAND = '{sysupgrade} -v -c {path}'
+    # path to sysupgrade command
+    _SYSUPGRADE = '/sbin/sysupgrade'
 
     log_lines = None
 
@@ -35,6 +37,7 @@ class OpenWrt(BaseOpenWrt):
         connection.set_connector(self)
         self.upgrade_operation = upgrade_operation
         self.connection = connection
+        self._non_critical_services_stopped = False
 
     def log(self, value, save=True):
         self.upgrade_operation.log_line(value, save=save)
@@ -54,11 +57,126 @@ class OpenWrt(BaseOpenWrt):
             raise RecoverableFailure('Connection failed')
         self.log('Connection successful, starting upgrade...')
 
-    def upload(self, *args, **kwargs):
+    def upload(self, image_file, remote_path):
+        self.check_memory(image_file)
         try:
-            super().upload(*args, **kwargs)
+            super().upload(image_file, remote_path)
         except Exception as e:
             raise RecoverableFailure(str(e))
+
+    _non_critical_services = [
+        'uhttpd',
+        'dnsmasq',
+        'openwisp_config',
+        'cron',
+        'rpcd',
+        'rssileds',
+        'odhcpd',
+        'log',
+    ]
+
+    def check_memory(self, image_file):
+        """
+        Tries to free up memory before upgrading
+        """
+        self._free_memory()
+        # if there's enouogh available memory, proceed
+        current_free_memory = self._get_free_memory()
+        if image_file.size < current_free_memory:
+            return
+        file_size_mib = self._get_mib(image_file.size)
+        free_memory_mib = self._get_mib(current_free_memory)
+        # otherwise try to free up some more memory by stopping services
+        self.log(
+            f'The image size ({file_size_mib} MiB) is greater '
+            f'than the available memory on the system ({free_memory_mib} MiB).\n'
+            'For this reason the upgrade procedure will try to free up '
+            'memory by stopping non critical services.\n'
+            'WARNING: it is recommended to reboot the device is the upgrade '
+            'fails unexpectedly because these services will not be restarted '
+            'automatically.\n'
+            'NOTE: The reboot can be avoided if the status of the upgrade becomes '
+            '"aborted" because in this case the system will restart the '
+            'services automatically.'
+        )
+        self._stop_non_critical_services()
+        self._free_memory()
+        # check memory again
+        # this time abort if there's still not enough free memory
+        current_free_memory = self._get_free_memory()
+        free_memory_mib = self._get_mib(current_free_memory)
+        if image_file.size < current_free_memory:
+            self.log(
+                'Enough available memory was freed up on the system '
+                f'({free_memory_mib} MiB)!\n'
+                'Proceeding to upload of the image file...'
+            )
+        else:
+            self.log(
+                'There is still not enough available memory on '
+                f'the system ({free_memory_mib} MiB).\n'
+                'Starting non critical services again...'
+            )
+            self._start_non_critical_services()
+            self.log('Non critical services started, aborting upgrade.')
+            raise UpgradeAborted()
+
+    def _get_mib(self, value):
+        """
+        Converts bytes to megabytes
+        """
+        if value == 0:
+            return value
+        _MiB = 1048576
+        return round(value / _MiB, 2)
+
+    def _get_free_memory(self):
+        """
+        Tries to get the available memory
+        If that fails it falls back to use MemFree (should happen only on older systems)
+        """
+        meminfo_grep = 'cat /proc/meminfo | grep'
+        output, exit_code = self.exec_command(
+            f'{meminfo_grep} MemAvailable', exit_codes=[0, 1]
+        )
+        if exit_code == 1:
+            output, exit_code = self.exec_command(f'{meminfo_grep} MemFree')
+        parts = output.split()
+        return int(parts[1]) * 1024
+
+    def _free_memory(self):
+        """
+        Attempts to free up some memory without stopping any service.
+        """
+        # remove OPKG index
+        self.exec_command('rm -rf /tmp/opkg-lists/')
+        # free internal cache
+        self.exec_command('sync && echo 3 > /proc/sys/vm/drop_caches')
+
+    def _stop_non_critical_services(self):
+        """
+        Stops non critical services in order to free up memory.
+        """
+        for service in self._non_critical_services:
+            initd = f'/etc/init.d/{service}'
+            self.exec_command(
+                f'test -f {initd} && {initd} stop', raise_unexpected_exit=False
+            )
+        self.exec_command('test -f /sbin/wifi && /sbin/wifi down')
+        self._non_critical_services_stopped = True
+
+    def _start_non_critical_services(self):
+        """
+        Starts again non critical services.
+        To be used if an upgrade operation is aborted.
+        """
+        for service in self._non_critical_services:
+            initd = f'/etc/init.d/{service}'
+            self.exec_command(
+                f'test -f {initd} && {initd} start', raise_unexpected_exit=False
+            )
+        self.exec_command('test -f /sbin/wifi && /sbin/wifi up')
+        self._non_critical_services_stopped = False
 
     def get_remote_path(self, image):
         # discard directory info from image name
@@ -66,7 +184,7 @@ class OpenWrt(BaseOpenWrt):
         return os.path.join(self.REMOTE_UPLOAD_DIR, filename)
 
     def get_upgrade_command(self, path):
-        return self.UPGRADE_COMMAND.format(path=path)
+        return self.UPGRADE_COMMAND.format(sysupgrade=self._SYSUPGRADE, path=path)
 
     def _test_checksum(self, image):
         """
@@ -84,7 +202,7 @@ class OpenWrt(BaseOpenWrt):
             self.log('Image checksum file found', save=False)
             cat = f'cat {self.CHECKSUM_FILE}'
             output, code = self.exec_command(cat)
-            if checksum == output:
+            if checksum == output.strip():
                 message = (
                     'Firmware already upgraded previously. '
                     'Identical checksum found in the filesystem, '
@@ -107,9 +225,13 @@ class OpenWrt(BaseOpenWrt):
 
     def _test_image(self, path):
         try:
-            self.exec_command(f'sysupgrade --test {path}')
+            self.exec_command(f'{self._SYSUPGRADE} --test {path}')
         except Exception as e:
             self.log(str(e), save=False)
+            # if non critical services were stopped to free up memory, restart them
+            if self._non_critical_services_stopped:
+                self.log('Starting non critical services again...')
+                self._start_non_critical_services()
             self.disconnect()
             raise UpgradeAborted()
         self.log(
@@ -119,7 +241,7 @@ class OpenWrt(BaseOpenWrt):
 
     def _reflash(self, path):
         """
-        this will execute the upgrade operation in another process
+        this method will execute the reflashing operation in another process
         because the SSH connection may hang indefinitely while reflashing
         and would block the program; setting a timeout to `exec_command`
         doesn't seem to take effect on some OpenWRT versions
@@ -127,20 +249,26 @@ class OpenWrt(BaseOpenWrt):
         `subprocess.join(timeout=self.UPGRADE_TIMEOUT)`
         """
         self.disconnect()
-        command = self.get_upgrade_command(path)
-
-        def upgrade(conn, path, timeout):
-            conn.connect()
-            conn.exec_command(command, timeout=timeout)
-            conn.disconnect()
-
-        subprocess = Process(target=upgrade, args=[self, path, self.UPGRADE_TIMEOUT])
-        subprocess.start()
         self.log('Upgrade operation in progress...')
+
+        failure_queue = Queue()
+        subprocess = Process(
+            target=self._call_reflash_command,
+            args=[self, path, self.UPGRADE_TIMEOUT, failure_queue],
+        )
+        subprocess.start()
         subprocess.join(timeout=self.UPGRADE_TIMEOUT)
+
+        # if the child process catched an exception, raise it here in the
+        # parent so it will be logged and will flag the upgrade as failed
+        if not failure_queue.empty():
+            raise failure_queue.get()
+        failure_queue.close()
+
+        self.upgrade_operation.refresh_from_db()
         self.log(
-            f'SSH connection closed, will wait {self.RECONNECT_DELAY} seconds before '
-            'attempting to reconnect...'
+            f'SSH connection closed, will wait {self.RECONNECT_DELAY} '
+            'seconds before attempting to reconnect...'
         )
         sleep(self.RECONNECT_DELAY)
         # kill the subprocess if it has hanged
@@ -148,12 +276,31 @@ class OpenWrt(BaseOpenWrt):
             subprocess.terminate()
             subprocess.join()
 
+    @classmethod
+    def _call_reflash_command(cls, upgrader, path, timeout, failure_queue):
+        try:
+            upgrader.connect()
+            command = upgrader.get_upgrade_command(path)
+            # remove persistent checksum if present (introduced in openwisp-config 0.6.0)
+            # otherwise the device will not download the configuration again after reflash
+            upgrader.exec_command(
+                'rm /etc/openwisp/checksum 2> /dev/null', exit_codes=[0, -1, 1]
+            )
+            output, exit_code = upgrader.exec_command(
+                command, timeout=timeout, exit_codes=[0, -1]
+            )
+            upgrader.log(output)
+        except Exception as e:
+            failure_queue.put(e)
+        upgrader.disconnect()
+
     def _refresh_addresses(self):
         """
         reloads the device info from the DB to
         handle cases in which the IP has changed
         """
         self.connection.device.refresh_from_db()
+        self.connection.refresh_from_db()
         self.addresses = self.connection.get_addresses()
 
     def _write_checksum(self, checksum):
@@ -166,10 +313,10 @@ class OpenWrt(BaseOpenWrt):
             )
             try:
                 self.connect()
-            except (NoValidConnectionsError, socket.timeout):
+            except (NoValidConnectionsError, socket.timeout) as error:
                 self.log(
-                    'Device not reachable yet, '
-                    f'retrying in {self.RECONNECT_RETRY_DELAY} seconds...'
+                    f'Device not reachable yet ({error}).\n'
+                    f'Retrying in {self.RECONNECT_RETRY_DELAY} seconds...'
                 )
                 sleep(self.RECONNECT_RETRY_DELAY)
                 continue
